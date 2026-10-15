@@ -42,6 +42,32 @@ For example you can invoke the linker like `wasm-component-ld --max-memory=N
 The `wasm-component-ld` binary has a few custom arguments for itself as well
 which are not forwarded to `wasm-ld` and can be explored with `-h` or `--help`.
 
+### Reactor initialization
+
+Reactor components initialize constructors automatically, including components
+using older bindings that call `__wasm_call_ctors` at export entry. The linker
+uses LLD's `--wrap` support to route constructor calls through one guard per
+core module instance. Component startup and existing bindings share that guard,
+so calling an older bindings helper after startup does not rerun constructors.
+Allocator exports do not run constructors.
+
+Existing `_initialize` and `cm32p2_initialize` exports are preserved. If neither
+exists, a `cm32p2_initialize` export invokes the guarded constructor dispatcher
+once imports are connected. An empty constructor dispatcher needs no guard or
+additional initialization module; the original linked core module is retained.
+
+This requires no bindings option or application feature. Rust builds targeting
+`wasm32-unknown-unknown` still need to select `wasm-component-ld` as their linker;
+the target's default linker does not produce components.
+
+Reactor builds perform a second link, including LTO, to add the shared guard
+and suppress LLD's per-export constructor/destructor wrappers. Commands with
+`_start`, explicit `--skip-wit-component`, shared-library output, and callers
+explicitly wrapping `__wasm_call_ctors` keep their existing startup behavior.
+Empty-constructor builds requesting linker maps, reproduction archives, or
+saved intermediates perform one additional link to keep those artifacts in
+sync with the retained module.
+
 # License
 
 This project is triple licenced under the Apache 2/ Apache 2 with LLVM exceptions/ MIT licences. The reasoning for this is:

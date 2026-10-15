@@ -12,6 +12,7 @@ use wit_component::StringEncoding;
 use wit_parser::{Resolve, WorldId};
 
 mod argfile;
+mod startup;
 
 /// Representation of a flag passed to `wasm-ld`
 ///
@@ -649,21 +650,63 @@ impl App {
         let mut core_module = std::fs::read(&temp_output)
             .with_context(|| format!("failed to read {linker:?} output: {temp_output:?}"))?;
 
-        // Inspect the output module to see if it's a command or reactor.
-        let mut exports_start = false;
-        for payload in wasmparser::Parser::new(0).parse_all(&core_module) {
-            match payload {
-                Ok(Payload::ExportSection(e)) => {
-                    for export in e {
-                        if let Ok(e) = export {
-                            if e.name == "_start" {
-                                exports_start = true;
-                                break;
-                            }
-                        }
-                    }
+        let original_exports = StartupExports::parse(&core_module)?;
+        let exports_start = original_exports.start;
+        let relocatable = lld_flags
+            .iter()
+            .any(|arg| matches!(arg.to_str(), Some("--relocatable" | "-relocatable" | "-r")));
+        // Respect an explicit user-provided constructor wrapper. Its startup
+        // policy belongs to the caller, just as command startup does.
+        let wraps_ctors = lld_flags.iter().any(|arg| {
+            matches!(
+                arg.to_str(),
+                Some("--wrap=__wasm_call_ctors" | "-wrap=__wasm_call_ctors")
+            )
+        }) || lld_flags.windows(2).any(|args| {
+            matches!(args[0].to_str(), Some("--wrap" | "-wrap")) && args[1] == "__wasm_call_ctors"
+        });
+        if !exports_start && !relocatable && !wraps_ctors {
+            // Put the guard in the constructor entry point itself. LLD's wrap
+            // option redirects calls from existing initializers and from older
+            // bindings to the same instance-local guard.
+            let startup_object = temp_dir.path().join("component-startup.o");
+            std::fs::write(&startup_object, startup::object())
+                .context("failed to write component startup object")?;
+            let extra_flags = [
+                startup_object.into_os_string(),
+                OsString::from("--wrap=__wasm_call_ctors"),
+                OsString::from("--export=__wasm_call_ctors"),
+                OsString::from(format!("--export={}", startup::REAL_CTORS)),
+            ];
+            let mut flags = lld_flags.clone();
+            flags.extend(extra_flags.iter());
+            let status = lld
+                .status(&temp_dir, &flags)
+                .with_context(|| format!("failed to spawn {linker:?} for reactor startup"))?;
+            if !status.success() {
+                bail!("failed to link reactor startup: {status}");
+            }
+            let linked = std::fs::read(&temp_output)
+                .context("failed to read LLD output after linking reactor startup")?;
+            // No constructors means no startup module or guard is needed.
+            // Keep the original link byte-for-byte in that case.
+            if !constructor_dispatcher_is_empty(&linked)? {
+                core_module = export_reactor_startup(&linked, &original_exports)?;
+            } else if has_linker_artifacts(&lld_flags) {
+                // The probe overwrote any map, reproduction archive, or saved
+                // linker output. Regenerate them for the original module we
+                // retain when its constructor dispatcher is empty.
+                let status = lld.status(&temp_dir, &lld_flags).with_context(|| {
+                    format!("failed to spawn {linker:?} to restore linker artifacts")
+                })?;
+                if !status.success() {
+                    bail!("failed to restore linker artifacts: {status}");
                 }
-                _ => {}
+                core_module = std::fs::read(&temp_output)
+                    .context("failed to read LLD output after restoring linker artifacts")?;
+            }
+            if self.component.reject_legacy_names {
+                core_module = alias_legacy_initializer(&core_module)?;
             }
         }
 
@@ -787,6 +830,218 @@ impl App {
         // be found.
         Lld::new("wasm-ld")
     }
+}
+
+fn has_linker_artifacts(args: &[&OsString]) -> bool {
+    args.iter().any(|arg| {
+        let name = arg
+            .as_encoded_bytes()
+            .split(|byte| *byte == b'=')
+            .next()
+            .unwrap();
+        matches!(
+            name,
+            b"--Map"
+                | b"-Map"
+                | b"--print-map"
+                | b"-print-map"
+                | b"-M"
+                | b"--reproduce"
+                | b"-reproduce"
+                | b"--save-temps"
+                | b"-save-temps"
+                | b"--why-extract"
+                | b"-why-extract"
+        )
+    })
+}
+
+#[derive(Default)]
+struct StartupExports {
+    start: bool,
+    initialize: bool,
+    constructors: bool,
+}
+
+impl StartupExports {
+    fn parse(wasm: &[u8]) -> Result<Self> {
+        let mut result = Self::default();
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let Payload::ExportSection(exports) = payload? {
+                for export in exports {
+                    let export = export?;
+                    if export.kind != wasmparser::ExternalKind::Func {
+                        continue;
+                    }
+                    match export.name {
+                        "_start" => result.start = true,
+                        "_initialize" | "cm32p2_initialize" => result.initialize = true,
+                        "__wasm_call_ctors" => result.constructors = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// Inspect LLD's actual constructor dispatcher, not its name-section metadata.
+/// A call to any initializer (including relocation helpers) is real work.
+fn constructor_dispatcher_is_empty(wasm: &[u8]) -> Result<bool> {
+    let mut imported_functions = 0;
+    let mut defined_function = 0;
+    let mut constructors = None;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            Payload::ImportSection(imports) => {
+                for import in imports.into_imports() {
+                    if matches!(
+                        import?.ty,
+                        wasmparser::TypeRef::Func(_) | wasmparser::TypeRef::FuncExact(_)
+                    ) {
+                        imported_functions += 1;
+                    }
+                }
+            }
+            Payload::ExportSection(exports) => {
+                for export in exports {
+                    let export = export?;
+                    if export.name == "__wasm_call_ctors"
+                        && export.kind == wasmparser::ExternalKind::Func
+                    {
+                        constructors = Some(export.index);
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                if constructors == Some(imported_functions + defined_function) {
+                    if body.get_locals_reader()?.get_count() != 0 {
+                        return Ok(false);
+                    }
+                    let mut operators = body.get_operators_reader()?;
+                    return Ok(
+                        matches!(operators.read()?, wasmparser::Operator::End) && operators.eof()
+                    );
+                }
+                defined_function += 1;
+            }
+            _ => {}
+        }
+    }
+    bail!("LLD did not export the original constructor dispatcher")
+}
+
+/// Remove inspection-only exports and expose guarded startup when it is
+/// missing. This only edits exports; LLD already relocated every code reference.
+fn export_reactor_startup(wasm: &[u8], original: &StartupExports) -> Result<Vec<u8>> {
+    use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
+
+    let mut module = wasm_encoder::Module::new();
+    let mut found_wrapper = false;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let payload = payload?;
+        if let Payload::ExportSection(reader) = payload {
+            let mut exports = wasm_encoder::ExportSection::new();
+            let entries = reader
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let wrapper = entries
+                .iter()
+                .find(|export| {
+                    export.name == startup::WRAP_CTORS
+                        && export.kind == wasmparser::ExternalKind::Func
+                })
+                .context("LLD did not export the guarded constructor dispatcher")?
+                .index;
+            if !original.initialize
+                && entries
+                    .iter()
+                    .any(|export| export.name == "cm32p2_initialize")
+            {
+                bail!("cannot supply reactor startup: cm32p2_initialize is not a function");
+            }
+            for export in entries {
+                let mut export = export;
+                if export.name == "__wasm_call_ctors" {
+                    if !original.constructors {
+                        continue;
+                    }
+                    // Preserve an explicit constructor export, with calls now
+                    // passing through the same guard as the older bindings.
+                    export.index = wrapper;
+                } else if export.name == startup::WRAP_CTORS {
+                    found_wrapper = true;
+                    if original.initialize {
+                        continue;
+                    }
+                    // The standard name is accepted with legacy names enabled
+                    // as well as with --reject-legacy-names.
+                    export.name = "cm32p2_initialize";
+                }
+                RoundtripReencoder.parse_export(&mut exports, export)?;
+            }
+            module.section(&exports);
+        } else if let Some((id, range)) = payload.as_section() {
+            module.section(&wasm_encoder::RawSection {
+                id,
+                data: &wasm[range.start as usize..range.end as usize],
+            });
+        }
+    }
+    if !found_wrapper {
+        bail!("LLD did not export the guarded constructor dispatcher");
+    }
+    Ok(module.finish())
+}
+
+/// A toolchain CRT can still use the module ABI's `_initialize` spelling when
+/// the bindings use standard component names. Preserve its entire initializer
+/// under an alias accepted by strict component encoding, including custom
+/// startup work beyond constructors.
+fn alias_legacy_initializer(wasm: &[u8]) -> Result<Vec<u8>> {
+    use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
+
+    let mut module = wasm_encoder::Module::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let payload = payload?;
+        if let Payload::ExportSection(reader) = payload {
+            let entries = reader
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if entries
+                .iter()
+                .any(|export| export.name == "cm32p2_initialize")
+            {
+                return Ok(wasm.to_vec());
+            }
+            let initializer = entries
+                .iter()
+                .find(|export| {
+                    export.name == "_initialize" && export.kind == wasmparser::ExternalKind::Func
+                })
+                .map(|export| export.index);
+            let Some(initializer) = initializer else {
+                return Ok(wasm.to_vec());
+            };
+            let mut exports = wasm_encoder::ExportSection::new();
+            for export in entries {
+                RoundtripReencoder.parse_export(&mut exports, export)?;
+            }
+            exports.export(
+                "cm32p2_initialize",
+                wasm_encoder::ExportKind::Func,
+                initializer,
+            );
+            module.section(&exports);
+        } else if let Some((id, range)) = payload.as_section() {
+            module.section(&wasm_encoder::RawSection {
+                id,
+                data: &wasm[range.start as usize..range.end as usize],
+            });
+        }
+    }
+    Ok(module.finish())
 }
 
 /// Helper structure representing an `lld` invocation.
