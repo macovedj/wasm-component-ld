@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -85,6 +85,163 @@ fn assert_component(bytes: &[u8]) {
 fn assert_module(bytes: &[u8]) {
     assert!(wasmparser::Parser::is_core_wasm(&bytes));
     wasmparser::Validator::new().validate_all(&bytes).unwrap();
+}
+
+fn core_exports(module: &[u8]) -> Vec<String> {
+    wasmparser::Parser::new(0)
+        .parse_all(module)
+        .flat_map(|payload| match payload.unwrap() {
+            wasmparser::Payload::ExportSection(exports) => exports
+                .into_iter()
+                .map(|export| export.unwrap().name.to_owned())
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn core_module_with_export<'a>(component: &'a [u8], name: &str) -> &'a [u8] {
+    wasmparser::Parser::new(0)
+        .parse_all(component)
+        .find_map(|payload| match payload.unwrap() {
+            wasmparser::Payload::ModuleSection {
+                unchecked_range, ..
+            } => {
+                let module =
+                    &component[unchecked_range.start as usize..unchecked_range.end as usize];
+                core_exports(module)
+                    .iter()
+                    .any(|export| export == name)
+                    .then_some(module)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no core module exports {name}"))
+}
+
+// Exclude target-provided startup objects so these tests exercise a missing
+// initializer even when rustc supplies one for ordinary WASI cdylibs.
+const REACTOR_ARGS: &[&str] = &[
+    "--crate-type=cdylib",
+    "-Cpanic=abort",
+    "-Clink-self-contained=no",
+];
+
+const REACTOR_SOURCE: &str = r#"
+#![no_std]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }
+
+static mut CTOR_RUNS: u32 = 0;
+
+extern "C" fn ctor() {
+    unsafe { CTOR_RUNS += 1; }
+}
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static CTOR: extern "C" fn() = ctor;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ctor_runs() -> u32 {
+    unsafe { CTOR_RUNS }
+}
+"#;
+
+#[test]
+fn initialize_reactor_supplies_missing_startup() {
+    let default = compile(REACTOR_ARGS, REACTOR_SOURCE);
+    assert_component(&default);
+    assert!(
+        !core_exports(core_module_with_export(&default, "ctor_runs"))
+            .iter()
+            .any(|name| name == "_initialize")
+    );
+
+    let mut args = REACTOR_ARGS.to_vec();
+    args.push("-Clink-arg=--initialize-reactor");
+    let output = compile(&args, REACTOR_SOURCE);
+    assert_component(&output);
+    let exports = core_exports(core_module_with_export(&output, "ctor_runs"));
+    assert_eq!(
+        exports.iter().filter(|name| *name == "_initialize").count(),
+        1
+    );
+    assert!(!exports.iter().any(|name| name == "__wasm_call_ctors"));
+}
+
+#[test]
+fn initialize_reactor_preserves_existing_initializer() {
+    let source = format!(
+        "{REACTOR_SOURCE}{}",
+        r#"
+unsafe extern "C" { fn __wasm_call_ctors(); }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _initialize() {
+    unsafe {
+        __wasm_call_ctors();
+        CTOR_RUNS += 100;
+    }
+}
+"#,
+    );
+    let default = compile(REACTOR_ARGS, &source);
+    let mut args = REACTOR_ARGS.to_vec();
+    args.push("-Clink-arg=--initialize-reactor");
+    let output = compile(&args, &source);
+    assert_component(&output);
+    assert_eq!(
+        core_module_with_export(&default, "_initialize"),
+        core_module_with_export(&output, "_initialize"),
+    );
+}
+
+#[test]
+fn initialize_reactor_preserves_command_startup() {
+    let default = compile(&[], "fn main() {}");
+    let output = compile(&["-Clink-arg=--initialize-reactor"], "fn main() {}");
+    assert_component(&output);
+    assert_eq!(
+        core_module_with_export(&default, "_start"),
+        core_module_with_export(&output, "_start"),
+    );
+}
+
+#[test]
+fn initialize_reactor_does_not_change_skipped_components() {
+    let mut args = REACTOR_ARGS.to_vec();
+    args.push("-Clink-arg=--skip-wit-component");
+    let default = compile(&args, REACTOR_SOURCE);
+    args.push("-Clink-arg=--initialize-reactor");
+    let output = compile(&args, REACTOR_SOURCE);
+    assert_module(&output);
+    assert_eq!(default, output);
+    assert!(
+        !core_exports(&output)
+            .iter()
+            .any(|name| name == "_initialize" || name == "__wasm_call_ctors")
+    );
+}
+
+#[test]
+fn initialize_reactor_rejects_relocatable_output() {
+    let error = Project::new()
+        .try_compile(
+            &[
+                "-Clink-arg=--initialize-reactor",
+                "-Clink-arg=--relocatable",
+            ],
+            "fn main() {}",
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("--initialize-reactor cannot be used with relocatable output")
+    );
 }
 
 #[test]

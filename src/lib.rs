@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{ArgAction, CommandFactory, FromArgMatches};
 use clap_lex::OsStrExt;
 use lexopt::Arg;
@@ -336,6 +336,14 @@ struct ComponentLdArgs {
     #[clap(long)]
     skip_wit_component: bool,
 
+    /// Supply reactor startup when neither `_initialize` nor `_start` is exported.
+    ///
+    /// Use this with bindings that do not run constructors themselves. Missing
+    /// startup requires a second link to disable LLD's per-export constructor
+    /// wrappers. Shared libraries and --skip-wit-component are unaffected.
+    #[clap(long)]
+    initialize_reactor: bool,
+
     /// Raw flags to pass to the end of the `lld` invocation in case they're
     /// not already recognized by this wrapper executable.
     #[clap(long)]
@@ -596,6 +604,16 @@ impl App {
     }
 
     fn run(&mut self) -> Result<()> {
+        if self.component.initialize_reactor
+            && !self.skip_wit_component()
+            && self
+                .lld_args
+                .iter()
+                .chain(&self.component.append_lld_flag)
+                .any(|arg| arg == "--relocatable" || arg == "-r")
+        {
+            bail!("--initialize-reactor cannot be used with relocatable output");
+        }
         let mut lld = self.lld();
 
         // If a temporary output is needed make sure it has the same file name
@@ -651,20 +669,44 @@ impl App {
 
         // Inspect the output module to see if it's a command or reactor.
         let mut exports_start = false;
+        let mut exports_initialize = false;
         for payload in wasmparser::Parser::new(0).parse_all(&core_module) {
             match payload {
                 Ok(Payload::ExportSection(e)) => {
                     for export in e {
                         if let Ok(e) = export {
+                            if e.kind != wasmparser::ExternalKind::Func {
+                                continue;
+                            }
                             if e.name == "_start" {
                                 exports_start = true;
-                                break;
+                            } else if e.name == "_initialize" {
+                                exports_initialize = true;
                             }
                         }
                     }
                 }
                 _ => {}
             }
+        }
+
+        if self.component.initialize_reactor && !exports_start && !exports_initialize {
+            // LLD suppresses per-export ctor/dtor wrappers when the caller
+            // explicitly exports __wasm_call_ctors. Relink the original inputs
+            // so those wrappers are never created; adding startup after the
+            // first link would leave the wrappers in place.
+            let export_ctors = OsString::from("--export=__wasm_call_ctors");
+            let mut flags = lld_flags.clone();
+            flags.push(&export_ctors);
+            let status = lld
+                .status(&temp_dir, &flags)
+                .with_context(|| format!("failed to spawn {linker:?} for reactor startup"))?;
+            if !status.success() {
+                bail!("failed to link reactor startup: {status}");
+            }
+            let linked = std::fs::read(&temp_output)
+                .context("failed to read LLD output after linking reactor startup")?;
+            core_module = export_ctors_as_initialize(&linked)?;
         }
 
         if !self.component.component_types.is_empty() {
@@ -787,6 +829,42 @@ impl App {
         // be found.
         Lld::new("wasm-ld")
     }
+}
+
+/// Give component encoding a single startup entry point without changing any
+/// function bodies or indices. The core initializer is called once by the
+/// component's startup sequence and is not exposed as an application export.
+fn export_ctors_as_initialize(wasm: &[u8]) -> Result<Vec<u8>> {
+    use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
+
+    let mut module = wasm_encoder::Module::new();
+    let mut renamed = false;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        let payload = payload?;
+        if let Payload::ExportSection(reader) = payload {
+            let mut exports = wasm_encoder::ExportSection::new();
+            for export in reader {
+                let mut export = export?;
+                if export.name == "__wasm_call_ctors"
+                    && export.kind == wasmparser::ExternalKind::Func
+                {
+                    export.name = "_initialize";
+                    renamed = true;
+                }
+                RoundtripReencoder.parse_export(&mut exports, export)?;
+            }
+            module.section(&exports);
+        } else if let Some((id, range)) = payload.as_section() {
+            module.section(&wasm_encoder::RawSection {
+                id,
+                data: &wasm[range.start as usize..range.end as usize],
+            });
+        }
+    }
+    if !renamed {
+        bail!("LLD did not export __wasm_call_ctors for reactor startup");
+    }
+    Ok(module.finish())
 }
 
 /// Helper structure representing an `lld` invocation.

@@ -42,6 +42,21 @@ For example you can invoke the linker like `wasm-component-ld --max-memory=N
 The `wasm-component-ld` binary has a few custom arguments for itself as well
 which are not forwarded to `wasm-ld` and can be explored with `-h` or `--help`.
 
+### Reactor initialization
+
+`--initialize-reactor` supplies constructor startup for component builds whose
+bindings do not initialize constructors themselves. Existing `_initialize` and
+`_start` exports are preserved. If both are absent, the linker relinks the
+original inputs with `__wasm_call_ctors` exported, disabling LLD's per-export
+constructor/destructor wrappers. It then names that core export `_initialize`
+so component initialization calls it once, after imports are connected.
+
+For Rust, pass `-C linker=wasm-component-ld -C link-arg=--initialize-reactor`.
+This is opt-in because combining automatic startup with older bindings that
+run constructors at export entry can run them twice. The fallback costs a
+second link, including LTO; builds already providing startup link once.
+`--skip-wit-component` and shared-library output are unaffected.
+
 # License
 
 This project is triple licenced under the Apache 2/ Apache 2 with LLVM exceptions/ MIT licences. The reasoning for this is:

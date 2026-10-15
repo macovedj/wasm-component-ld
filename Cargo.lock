@@ -406,6 +406,7 @@ dependencies = [
  "libc",
  "tempfile",
  "wasi-preview1-component-adapter-provider",
+ "wasm-encoder",
  "wasmparser",
  "wat",
  "windows-sys",
